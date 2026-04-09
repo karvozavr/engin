@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Annotated
 
@@ -220,6 +221,101 @@ async def test_assembler_provider_multi_scope():
         await assembler.build(int)
 
 
+async def test_assembler_scoped_provider_reused_in_child_scope():
+    call_count = 0
+
+    def scoped_provider() -> int:
+        nonlocal call_count
+        call_count += 1
+        return call_count
+
+    assembler = Assembler([Provide(scoped_provider, scope="foo")])
+
+    with assembler.scope("foo"):
+        outer = await assembler.build(int)
+        with assembler.scope("bar"):
+            inner = await assembler.build(int)
+
+    assert outer is inner, "scoped provider was rebuilt in child scope instead of being reused"
+    assert call_count == 1, f"expected 1 provider call, got {call_count}"
+
+
+async def test_assembler_scoped_transitive_dep_isolated_across_concurrent_tasks():
+    """Scoped types resolved as transitive deps (via _satisfy) must also be task-local."""
+    call_count = 0
+
+    def scoped_dep() -> int:
+        nonlocal call_count
+        call_count += 1
+        return call_count
+
+    def dependent_service(dep: int) -> str:
+        return f"service-{dep}"
+
+    assembler = Assembler(
+        [Provide(scoped_dep, scope="request"), Provide(dependent_service, scope="request")]
+    )
+
+    task_a_has_built = asyncio.Event()
+    a_dep: int | None = None
+    b_dep: int | None = None
+
+    async def task_a() -> None:
+        nonlocal a_dep
+        with assembler.scope("request"):
+            svc = await assembler.build(str)
+            a_dep = int(svc.split("-")[1])
+            task_a_has_built.set()
+            await asyncio.sleep(0)
+
+    async def task_b() -> None:
+        nonlocal b_dep
+        await task_a_has_built.wait()
+        with assembler.scope("request"):
+            svc = await assembler.build(str)
+            b_dep = int(svc.split("-")[1])
+
+    await asyncio.gather(task_a(), task_b())
+
+    assert call_count == 2, f"expected 2 provider calls, got {call_count}"
+    assert a_dep != b_dep, "scoped transitive dep was shared across concurrent tasks"
+
+
+async def test_assembler_scoped_provider_isolated_across_concurrent_tasks():
+    call_count = 0
+
+    def scoped_provider() -> int:
+        nonlocal call_count
+        call_count += 1
+        return call_count
+
+    assembler = Assembler([Provide(scoped_provider, scope="request")])
+
+    task_a_has_built = asyncio.Event()
+    a_value: int | None = None
+    b_value: int | None = None
+
+    async def task_a() -> None:
+        nonlocal a_value
+        with assembler.scope("request"):
+            a_value = await assembler.build(int)
+            task_a_has_built.set()
+            # Yield while still in scope — this is the race window where task_b runs.
+            await asyncio.sleep(0)
+
+    async def task_b() -> None:
+        nonlocal b_value
+        # Wait until task_a has built but not yet exited its scope.
+        await task_a_has_built.wait()
+        with assembler.scope("request"):
+            b_value = await assembler.build(int)
+
+    await asyncio.gather(task_a(), task_b())
+
+    assert call_count == 2, f"expected 2 provider calls, got {call_count}"
+    assert a_value != b_value, "scoped provider was shared across concurrent tasks"
+
+
 async def test_assembler_with_modifier():
     def make_str() -> str:
         return "foo"
@@ -346,3 +442,124 @@ async def test_assembler_modifier_with_multiprovider():
 
     result = await assembler.build(list[int])
     assert result == [2, 4, 6, 8]
+
+
+async def test_modified_scoped_values_isolated_across_concurrent_tasks():
+    """Bug #2: modified scoped values must be task-local, not globally cached."""
+    call_count = 0
+
+    def scoped_int() -> int:
+        nonlocal call_count
+        call_count += 1
+        return call_count * 100
+
+    def double(value: int) -> int:
+        return value * 2
+
+    from engin import Modify
+
+    modifier = Modify(double)
+    assembler = Assembler.from_mapped_providers(
+        providers={},
+        multiproviders={},
+        modifiers={modifier.modifies_type_id: modifier},
+    )
+    assembler.add(Provide(scoped_int, scope="request"))
+
+    task_a_has_built = asyncio.Event()
+    a_value: int | None = None
+    b_value: int | None = None
+
+    async def task_a() -> None:
+        nonlocal a_value
+        with assembler.scope("request"):
+            a_value = await assembler.build(int)
+            task_a_has_built.set()
+            await asyncio.sleep(0)
+
+    async def task_b() -> None:
+        nonlocal b_value
+        await task_a_has_built.wait()
+        with assembler.scope("request"):
+            b_value = await assembler.build(int)
+
+    await asyncio.gather(task_a(), task_b())
+
+    assert a_value == 200, f"expected 200, got {a_value}"
+    assert b_value == 400, f"expected 400, got {b_value}"
+    assert a_value != b_value, "modified scoped values leaked across tasks"
+
+
+async def test_subtask_scope_does_not_corrupt_parent_scope():
+    """Bug #1: spawned subtask entering inner scope must not corrupt parent's scope."""
+    call_count = 0
+
+    def outer_provider() -> int:
+        nonlocal call_count
+        call_count += 1
+        return call_count
+
+    assembler = Assembler([Provide(outer_provider, scope="outer")])
+
+    async def subtask() -> None:
+        with assembler.scope("inner"):
+            await asyncio.sleep(0)
+
+    with assembler.scope("outer"):
+        val1 = await assembler.build(int)
+
+        # Spawn a subtask that enters a different scope
+        await asyncio.create_task(subtask())
+
+        # Parent scope should still be intact — same cached value
+        val2 = await assembler.build(int)
+
+    assert val1 is val2, "parent scope was corrupted by subtask"
+    assert call_count == 1, f"expected 1 provider call, got {call_count}"
+
+
+async def test_scoped_modifier_reruns_per_scope_entry():
+    """Sequential regression: modifier must re-run on each scope entry, not use stale cache."""
+    provider_count = 0
+    modifier_count = 0
+
+    def scoped_int() -> int:
+        nonlocal provider_count
+        provider_count += 1
+        return provider_count * 10
+
+    def add_one(value: int) -> int:
+        nonlocal modifier_count
+        modifier_count += 1
+        return value + 1
+
+    from engin import Modify
+
+    modifier = Modify(add_one)
+    assembler = Assembler.from_mapped_providers(
+        providers={},
+        multiproviders={},
+        modifiers={modifier.modifies_type_id: modifier},
+    )
+    assembler.add(Provide(scoped_int, scope="request"))
+
+    with assembler.scope("request"):
+        first = await assembler.build(int)
+
+    with assembler.scope("request"):
+        second = await assembler.build(int)
+
+    assert first == 11, f"expected 11, got {first}"
+    assert second == 21, f"expected 21, got {second}"
+    assert provider_count == 2, f"provider should have run twice, ran {provider_count}"
+    assert modifier_count == 2, f"modifier should have run twice, ran {modifier_count}"
+
+
+def test_scoped_multiprovider_rejected():
+    """Multiproviders cannot be scoped — rejected at construction time."""
+
+    def scoped_ints() -> list[int]:
+        return [1]
+
+    with pytest.raises(ValueError, match="Multiproviders cannot be scoped"):
+        Provide(scoped_ints, scope="request")
